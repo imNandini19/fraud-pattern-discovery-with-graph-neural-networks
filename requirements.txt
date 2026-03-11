@@ -1,0 +1,9 @@
+torch-geometric==2.7.0
+pandas==2.3.3
+numpy==2.0.1
+networkx==3.4.2
+matplotlib
+seaborn
+scikit-learn
+streamlit
+
