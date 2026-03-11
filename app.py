@@ -4,14 +4,14 @@ Author: Venkata Nandini Mamillapalli
 GitHub: https://github.com/imNandini19/
 LinkedIn: https://www.linkedin.com/in/iamnandini19/
 
-Problem Statement:
-    Traditional fraud detection looks at one transaction at a time.
-    This misses coordinated fraud rings — groups of wallets that
-    work together to launder money. By modeling transactions as a
-    graph and using Union-Find + GraphSAGE, we detect the entire ring,
-    not just individual bad actors.
+Run locally : streamlit run app.py
+Deployed at : Streamlit Cloud
 
-Run: streamlit run app.py
+How this works:
+  - Loads pre-saved graph_data.pkl  (adjacency list, labels, fraud rings)
+  - Loads pre-saved fraud_gnn_model.pt (trained weights — no training at startup)
+  - App starts in 2-3 seconds instead of 60 seconds
+  - No CSV files needed at runtime
 """
 
 import streamlit as st
@@ -26,6 +26,8 @@ from matplotlib.patches import Patch
 from collections import defaultdict, deque
 from torch_geometric.nn import SAGEConv
 from torch_geometric.data import Data
+import pickle
+import os
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -57,58 +59,7 @@ class FraudGNN(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────
-# GRAPH BUILDER — identical to notebook
-# ─────────────────────────────────────────────────────────────
-class FraudGraphBuilder:
-    def __init__(self):
-        self.node_id_map   = {}                 # hash map: string txId → integer index
-        self.next_id       = 0
-        self.adj           = defaultdict(list)  # adjacency list: node → [neighbours]
-        self.node_labels   = {}                 # node → 0 (fraud) or 1 (legit)
-        self.node_features = {}                 # node → 166 features
-        self.edge_list     = []
-
-    def get_or_create_node(self, tx_id):
-        tx_id = str(tx_id)
-        if tx_id not in self.node_id_map:
-            self.node_id_map[tx_id] = self.next_id
-            self.next_id += 1
-        return self.node_id_map[tx_id]
-
-    def build(self, df_classes, df_edges, df_features, max_nodes=10000):
-        labeled = df_classes[df_classes['class'] != 'unknown'].head(max_nodes)
-        for _, row in labeled.iterrows():
-            idx = self.get_or_create_node(row['txId'])
-            self.node_labels[idx] = 0 if str(row['class']) == '1' else 1
-
-        node_set    = set(self.node_id_map.keys())
-        edges_added = 0
-        for _, row in df_edges.iterrows():
-            s, d = str(row['txId1']), str(row['txId2'])
-            if s in node_set and d in node_set:
-                si, di = self.node_id_map[s], self.node_id_map[d]
-                self.adj[si].append(di)
-                self.adj[di].append(si)
-                self.edge_list.append((si, di))
-                edges_added += 1
-            if edges_added >= max_nodes * 2:
-                break
-
-        feat_cols = df_features.iloc[:, 1:]
-        for i, row in df_features.iterrows():
-            tx_id = str(int(row[0]))
-            if tx_id in self.node_id_map:
-                ni = self.node_id_map[tx_id]
-                self.node_features[ni] = feat_cols.iloc[i].values.tolist()
-        return self
-
-
-# ─────────────────────────────────────────────────────────────
 # UNION-FIND — identical to notebook
-# This is what detects fraud rings.
-# find()  → which ring does this node belong to?
-# union() → merge two nodes into the same ring
-# get_components() → return all rings as { root: [members] }
 # ─────────────────────────────────────────────────────────────
 class UnionFind:
     def __init__(self, n):
@@ -116,7 +67,6 @@ class UnionFind:
         self.size   = [1] * n
 
     def find(self, x):
-        # Path compression — every node points directly to root after first call
         if self.parent[x] != x:
             self.parent[x] = self.find(self.parent[x])
         return self.parent[x]
@@ -125,7 +75,6 @@ class UnionFind:
         rx, ry = self.find(x), self.find(y)
         if rx == ry:
             return
-        # Union by size — attach smaller tree under larger tree
         if self.size[rx] < self.size[ry]:
             rx, ry = ry, rx
         self.parent[ry]  = rx
@@ -140,12 +89,10 @@ class UnionFind:
 
 # ─────────────────────────────────────────────────────────────
 # BFS — identical to notebook
-# Extracts k-hop neighbourhood around a node.
-# Used to visualise the ring structure in the graph.
 # ─────────────────────────────────────────────────────────────
 def bfs_subgraph(adj, start_node, max_hops=2, max_nodes=40):
     visited  = set()
-    queue    = deque()   # deque not list — popleft is O(1) not O(n)
+    queue    = deque()
     hop_dist = {}
 
     queue.append(start_node)
@@ -171,17 +118,52 @@ def bfs_subgraph(adj, start_node, max_hops=2, max_nodes=40):
 
 
 # ─────────────────────────────────────────────────────────────
+# DETECT FRAUD RINGS — identical to notebook
+# ─────────────────────────────────────────────────────────────
+def detect_fraud_rings(adj, node_labels, edge_list, next_id, min_size=3):
+    uf = UnionFind(next_id)
+    for src, dst in edge_list:
+        uf.union(src, dst)
+
+    components  = uf.get_components()
+    fraud_rings = []
+
+    for root, members in components.items():
+        if len(members) < min_size:
+            continue
+        labeled_members = [m for m in members if m in node_labels]
+        if not labeled_members:
+            continue
+        fraud_in_ring = sum(1 for m in labeled_members if node_labels[m] == 0)
+        fraud_ratio   = fraud_in_ring / len(labeled_members)
+        if fraud_ratio >= 0.5:
+            fraud_rings.append({
+                "root"        : root,
+                "members"     : members,
+                "size"        : len(members),
+                "fraud_nodes" : fraud_in_ring,
+                "fraud_ratio" : fraud_ratio,
+            })
+
+    fraud_rings.sort(key=lambda x: x["size"], reverse=True)
+    for i, ring in enumerate(fraud_rings):
+        ring["ring_number"] = i + 1
+
+    return fraud_rings
+
+
+# ─────────────────────────────────────────────────────────────
 # BUILD PyG DATA — identical to notebook
 # ─────────────────────────────────────────────────────────────
-def build_pyg_data(builder):
-    valid_nodes = sorted([n for n in builder.node_labels if n in builder.node_features])
+def build_pyg_data(node_labels, node_features, edge_list):
+    valid_nodes = sorted([n for n in node_labels if n in node_features])
     remap       = {old: new for new, old in enumerate(valid_nodes)}
 
-    x = torch.tensor([builder.node_features[n] for n in valid_nodes], dtype=torch.float)
-    y = torch.tensor([builder.node_labels[n]   for n in valid_nodes], dtype=torch.long)
+    x = torch.tensor([node_features[n] for n in valid_nodes], dtype=torch.float)
+    y = torch.tensor([node_labels[n]   for n in valid_nodes], dtype=torch.long)
 
     srcs, dsts = [], []
-    for s, d in builder.edge_list:
+    for s, d in edge_list:
         if s in remap and d in remap:
             srcs += [remap[s], remap[d]]
             dsts += [remap[d], remap[s]]
@@ -200,120 +182,148 @@ def build_pyg_data(builder):
 
 
 # ─────────────────────────────────────────────────────────────
-# DETECT FRAUD RINGS using Union-Find
-# Returns list of rings sorted by size (largest first)
-# ─────────────────────────────────────────────────────────────
-def detect_fraud_rings(builder, min_size=3):
-    """
-    Run Union-Find on all edges.
-    A ring = connected component where majority of labeled nodes are fraud.
-    Returns a list of dicts, one per ring, sorted by size descending.
-    """
-    uf = UnionFind(builder.next_id)
-
-    # Union every edge — this builds the connected components
-    for src, dst in builder.edge_list:
-        uf.union(src, dst)
-
-    components  = uf.get_components()
-    fraud_rings = []
-
-    for root, members in components.items():
-        if len(members) < min_size:
-            continue
-
-        # Only count labeled nodes when computing fraud ratio
-        labeled_members = [m for m in members if m in builder.node_labels]
-        if not labeled_members:
-            continue
-
-        fraud_in_ring = sum(1 for m in labeled_members if builder.node_labels[m] == 0)
-        fraud_ratio   = fraud_in_ring / len(labeled_members)
-
-        if fraud_ratio >= 0.5:
-            fraud_rings.append({
-                "root"        : root,           # Union-Find root — proves origin
-                "members"     : members,        # all nodes in this component
-                "size"        : len(members),
-                "fraud_nodes" : fraud_in_ring,
-                "fraud_ratio" : fraud_ratio,
-            })
-
-    fraud_rings.sort(key=lambda x: x["size"], reverse=True)
-
-    # Assign readable ring numbers AFTER sorting by size
-    for i, ring in enumerate(fraud_rings):
-        ring["ring_number"] = i + 1
-
-    return fraud_rings, uf
-
-
-# ─────────────────────────────────────────────────────────────
-# LOAD + TRAIN — cached, runs once on first launch
+# LOAD EVERYTHING — cached, runs once
+#
+# Looks for graph_data.pkl + fraud_gnn_model.pt in outputs/
+# If pkl is missing, falls back to building from CSVs in data/
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
-def load_and_train():
-    try:
-        df_cls  = pd.read_csv('data/elliptic_txs_classes.csv')
-        df_edg  = pd.read_csv('data/elliptic_txs_edgelist.csv')
-        df_feat = pd.read_csv('data/elliptic_txs_features.csv', header=None)
-    except FileNotFoundError:
-        return None, None, None, None, None, None, None, "MISSING"
+def load_everything():
 
-    df_cls = df_cls.rename(columns={df_cls.columns[0]: 'txId',  df_cls.columns[1]: 'class'})
-    df_edg = df_edg.rename(columns={df_edg.columns[0]: 'txId1', df_edg.columns[1]: 'txId2'})
+    # ── Step 1: Load graph data ──────────────────────────────
+    pkl_path = os.path.join("outputs", "graph_data.pkl")
+    csv_path = os.path.join("data", "elliptic_txs_classes.csv")
 
-    # Build graph
-    builder = FraudGraphBuilder()
-    builder.build(df_cls, df_edg, df_feat, max_nodes=10000)
+    if os.path.exists(pkl_path):
+        # Fast path — load pre-saved graph (Streamlit Cloud uses this)
+        with open(pkl_path, "rb") as f:
+            saved = pickle.load(f)
+        node_id_map   = saved["node_id_map"]
+        adj           = defaultdict(list, saved["adj"])
+        node_labels   = saved["node_labels"]
+        node_features = saved["node_features"]
+        edge_list     = saved["edge_list"]
+        fraud_rings   = saved["fraud_rings"]
+        next_id       = max(node_id_map.values()) + 1
 
-    # Detect all fraud rings up front — shared by all tabs
-    fraud_rings, uf = detect_fraud_rings(builder, min_size=3)
+    elif os.path.exists(csv_path):
+        # Slow path — build from CSVs (local machine fallback)
+        from collections import defaultdict as dd
 
-    # Build a lookup: node → which ring it belongs to (if any)
+        df_cls  = pd.read_csv("data/elliptic_txs_classes.csv")
+        df_edg  = pd.read_csv("data/elliptic_txs_edgelist.csv")
+        df_feat = pd.read_csv("data/elliptic_txs_features.csv", header=None)
+
+        df_cls = df_cls.rename(columns={df_cls.columns[0]: "txId", df_cls.columns[1]: "class"})
+        df_edg = df_edg.rename(columns={df_edg.columns[0]: "txId1", df_edg.columns[1]: "txId2"})
+
+        # Build graph manually (same logic as FraudGraphBuilder in notebook)
+        node_id_map   = {}
+        next_id       = 0
+        adj           = defaultdict(list)
+        node_labels   = {}
+        node_features = {}
+        edge_list     = []
+
+        labeled = df_cls[df_cls["class"] != "unknown"].head(10000)
+        for _, row in labeled.iterrows():
+            tx = str(row["txId"])
+            if tx not in node_id_map:
+                node_id_map[tx] = next_id
+                next_id += 1
+            node_labels[node_id_map[tx]] = 0 if str(row["class"]) == "1" else 1
+
+        node_set    = set(node_id_map.keys())
+        edges_added = 0
+        for _, row in df_edg.iterrows():
+            s, d = str(row["txId1"]), str(row["txId2"])
+            if s in node_set and d in node_set:
+                si, di = node_id_map[s], node_id_map[d]
+                adj[si].append(di)
+                adj[di].append(si)
+                edge_list.append((si, di))
+                edges_added += 1
+            if edges_added >= 20000:
+                break
+
+        feat_cols = df_feat.iloc[:, 1:]
+        for i, row in df_feat.iterrows():
+            tx = str(int(row[0]))
+            if tx in node_id_map:
+                ni = node_id_map[tx]
+                node_features[ni] = feat_cols.iloc[i].values.tolist()
+
+        fraud_rings = detect_fraud_rings(adj, node_labels, edge_list, next_id)
+
+    else:
+        return None, None, None, None, None, None, None, None, "MISSING"
+
+    # ── Step 2: Build PyG data object ───────────────────────
+    data, remap, valid_nodes = build_pyg_data(node_labels, node_features, edge_list)
+
+    # ── Step 3: Load trained model weights ──────────────────
+    pt_path = os.path.join("outputs", "fraud_gnn_model.pt")
+    if not os.path.exists(pt_path):
+        return None, None, None, None, None, None, None, None, "NO_MODEL"
+
+    checkpoint = torch.load(pt_path, map_location="cpu")
+    model      = FraudGNN(in_channels=data.num_node_features)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    # ── Step 4: Build node → ring lookup ────────────────────
     node_to_ring = {}
     for ring in fraud_rings:
         for member in ring["members"]:
             node_to_ring[member] = ring
 
-    # Build PyG data and train model
-    data, remap, valid_nodes = build_pyg_data(builder)
-
-    fc    = data.y[data.train_mask].eq(0).sum().item()
-    lc    = data.y[data.train_mask].eq(1).sum().item()
-    total = fc + lc
-    cw    = torch.tensor([total / (2 * fc), total / (2 * lc)], dtype=torch.float)
-
-    model     = FraudGNN(data.num_node_features)
-    criterion = nn.CrossEntropyLoss(weight=cw)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
-
-    for epoch in range(200):
-        model.train()
-        optimizer.zero_grad()
-        out  = model(data.x, data.edge_index)
-        loss = criterion(out[data.train_mask], data.y[data.train_mask])
-        loss.backward()
-        optimizer.step()
-
-    model.eval()
-    return model, builder, data, remap, valid_nodes, fraud_rings, node_to_ring, "OK"
+    return (model, adj, node_labels, node_features,
+            edge_list, data, remap, valid_nodes,
+            fraud_rings, node_to_ring, node_id_map, "OK")
 
 
 # ─────────────────────────────────────────────────────────────
 # APP STARTS HERE
 # ─────────────────────────────────────────────────────────────
-with st.spinner("Loading data, detecting fraud rings, training model... (~60 sec first time)"):
-    model, builder, data, remap, valid_nodes, fraud_rings, node_to_ring, status = load_and_train()
+with st.spinner("Loading model and graph data..."):
+    result = load_everything()
 
-if status == "MISSING":
-    st.error("Put the 3 Elliptic CSV files inside a `data/` folder next to app.py")
+# Unpack result
+if result[-1] == "MISSING":
+    st.error("""
+    **Cannot find graph data or CSV files.**
+
+    Run this cell in your notebook first, then push `outputs/graph_data.pkl` to GitHub:
+
+    ```python
+    import pickle
+    save_data = {
+        'node_id_map'   : builder.node_id_map,
+        'adj'           : dict(builder.adj),
+        'node_labels'   : builder.node_labels,
+        'node_features' : builder.node_features,
+        'edge_list'     : builder.edge_list,
+        'fraud_rings'   : fraud_rings,
+    }
+    with open('../outputs/graph_data.pkl', 'wb') as f:
+        pickle.dump(save_data, f)
+    print("Done — push outputs/graph_data.pkl to GitHub")
+    ```
+    """)
     st.stop()
 
-# Reverse map: builder node index → txId string (for display)
-reverse_map = {v: k for k, v in builder.node_id_map.items()}
+if result[-1] == "NO_MODEL":
+    st.error("Cannot find `outputs/fraud_gnn_model.pt`. Push it to GitHub.")
+    st.stop()
 
-st.success(f"✅ Ready — {len(fraud_rings)} fraud rings detected in the graph")
+(model, adj, node_labels, node_features,
+ edge_list, data, remap, valid_nodes,
+ fraud_rings, node_to_ring, node_id_map, status) = result
+
+# Reverse map: node index → txId string
+reverse_map = {v: k for k, v in node_id_map.items()}
+
+st.success(f"✅ Model loaded · {len(fraud_rings)} fraud rings detected")
 st.divider()
 
 
@@ -329,8 +339,6 @@ tab1, tab2, tab3 = st.tabs([
 
 # ════════════════════════════════════════════════════════════
 # TAB 1 — FRAUD RING EXPLORER
-# This is the main demo tab. Core of the problem statement.
-# Pick any transaction → see its ring → see the GNN prediction
 # ════════════════════════════════════════════════════════════
 with tab1:
     st.subheader("Fraud Ring Explorer")
@@ -339,7 +347,6 @@ with tab1:
         "GraphSAGE gives the fraud probability using its 3-hop neighbourhood."
     )
 
-    # Let user pick from fraud nodes so they always see a ring
     col_left, col_right = st.columns([1, 2])
 
     with col_left:
@@ -348,54 +355,34 @@ with tab1:
             ["🔴 Fraud nodes", "🟢 Legit nodes"],
             horizontal=True
         )
-
         if node_type == "🔴 Fraud nodes":
-            pool = [n for n in valid_nodes if builder.node_labels.get(n) == 0]
+            pool = [n for n in valid_nodes if node_labels.get(n) == 0]
         else:
-            pool = [n for n in valid_nodes if builder.node_labels.get(n) == 1]
+            pool = [n for n in valid_nodes if node_labels.get(n) == 1]
 
-        # Show actual txId in the dropdown
         selected_node = st.selectbox(
             "Select transaction:",
             options     = pool[:50],
             format_func = lambda n: f"txId {reverse_map.get(n, n)}"
         )
 
-        st.button("Explore →", type="primary", key="explore_btn")
-
-    # Always show results (no button gate — makes demo smoother)
     with col_right:
         tx_id_display = reverse_map.get(selected_node, selected_node)
-        true_label    = builder.node_labels.get(selected_node)
+        true_label    = node_labels.get(selected_node)
         true_str      = "🔴 Fraud" if true_label == 0 else "🟢 Legit"
-
-        # ── Union-Find ring info ─────────────────────────────
-        ring = node_to_ring.get(selected_node)
+        ring          = node_to_ring.get(selected_node)
 
         st.markdown("#### Union-Find Result")
         if ring:
-            uf_root = ring["root"]
             st.success(f"This transaction belongs to **Fraud Ring #{ring['ring_number']}**")
-
-            # Show exactly what Union-Find produced — this is the proof
-            ring_df = pd.DataFrame([{
-                "Field"  : "Union-Find root node",
-                "Value"  : str(uf_root),
-            }, {
-                "Field"  : "Ring size (total members)",
-                "Value"  : str(ring["size"]),
-            }, {
-                "Field"  : "Fraud nodes in ring",
-                "Value"  : str(ring["fraud_nodes"]),
-            }, {
-                "Field"  : "Fraud ratio",
-                "Value"  : f"{ring['fraud_ratio']:.0%}",
-            }, {
-                "Field"  : "Source",
-                "Value"  : "uf.find() + uf.get_components()",
-            }])
+            ring_df = pd.DataFrame([
+                {"Field": "Union-Find root node",       "Value": str(ring["root"])},
+                {"Field": "Ring size (total members)",  "Value": str(ring["size"])},
+                {"Field": "Fraud nodes in ring",        "Value": str(ring["fraud_nodes"])},
+                {"Field": "Fraud ratio",                "Value": f"{ring['fraud_ratio']:.0%}"},
+                {"Field": "Source",                     "Value": "uf.find() + uf.get_components()"},
+            ])
             st.dataframe(ring_df, hide_index=True, use_container_width=True)
-
         else:
             st.info("This transaction is not part of any detected fraud ring.")
 
@@ -404,7 +391,6 @@ with tab1:
     # ── GNN Prediction ───────────────────────────────────────
     st.markdown("#### GraphSAGE Prediction")
 
-    model.eval()
     with torch.no_grad():
         out   = model(data.x, data.edge_index)
         probs = torch.softmax(out, dim=1)
@@ -420,8 +406,8 @@ with tab1:
             st.error("🚨 GNN says: FRAUD")
         else:
             st.success("✅ GNN says: LEGITIMATE")
-        st.write(f"**Ground truth:** {true_str}")
         match = "✅ Correct" if prediction == true_label else "❌ Wrong"
+        st.write(f"**Ground truth:** {true_str}")
         st.write(f"**Prediction:** {match}")
 
     with pc2:
@@ -429,31 +415,26 @@ with tab1:
         st.metric("Legit Probability", f"{legit_prob * 100:.1f}%")
 
     with pc3:
-        neighbours       = builder.adj.get(selected_node, [])
-        fraud_neighbours = [n for n in neighbours if builder.node_labels.get(n) == 0]
-        st.metric("Direct Neighbours",  len(neighbours))
-        st.metric("Fraud Neighbours",   len(fraud_neighbours))
+        neighbours       = adj.get(selected_node, [])
+        fraud_neighbours = [n for n in neighbours if node_labels.get(n) == 0]
+        st.metric("Direct Neighbours", len(neighbours))
+        st.metric("Fraud Neighbours",  len(fraud_neighbours))
 
     st.divider()
 
     # ── BFS Neighbourhood Graph ──────────────────────────────
-    st.markdown("#### 2-Hop BFS Neighbourhood (what GNN used to predict)")
+    st.markdown("#### 2-Hop BFS Neighbourhood")
     st.caption(
         "Yellow = selected transaction · "
-        "Red = fraud nodes · "
-        "Blue = legit nodes · "
-        "Red border = ring members detected by Union-Find"
+        "Red = fraud · "
+        "Blue = legit · "
+        "Yellow border = ring members detected by Union-Find"
     )
 
-    sub_nodes, sub_edges = bfs_subgraph(
-        builder.adj, selected_node, max_hops=2, max_nodes=40
-    )
-
-    # Ring members that appear in the subgraph
-    ring_members_in_sub = set(ring["members"]) if ring else set()
-
-    fraud_in_sub = [n for n in sub_nodes if builder.node_labels.get(n) == 0]
-    legit_in_sub = [n for n in sub_nodes if builder.node_labels.get(n) == 1]
+    sub_nodes, sub_edges = bfs_subgraph(adj, selected_node, max_hops=2, max_nodes=40)
+    ring_members_in_sub  = set(ring["members"]) if ring else set()
+    fraud_in_sub         = [n for n in sub_nodes if node_labels.get(n) == 0]
+    legit_in_sub         = [n for n in sub_nodes if node_labels.get(n) == 1]
 
     G   = nx.Graph()
     G.add_nodes_from(sub_nodes)
@@ -461,23 +442,19 @@ with tab1:
     pos = nx.spring_layout(G, seed=42)
 
     fig, ax = plt.subplots(figsize=(11, 6))
-
-    # Draw edges
     nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.3, edge_color="gray")
 
-    # Draw legit nodes
-    if legit_in_sub:
-        nx.draw_networkx_nodes(G, pos, nodelist=legit_in_sub, ax=ax,
+    legit_only = [n for n in legit_in_sub if n != selected_node]
+    if legit_only:
+        nx.draw_networkx_nodes(G, pos, nodelist=legit_only, ax=ax,
                                node_color="steelblue", node_size=180, alpha=0.7)
 
-    # Draw fraud nodes (not ring members)
     fraud_not_ring = [n for n in fraud_in_sub
                       if n not in ring_members_in_sub and n != selected_node]
     if fraud_not_ring:
         nx.draw_networkx_nodes(G, pos, nodelist=fraud_not_ring, ax=ax,
                                node_color="red", node_size=220, alpha=0.85)
 
-    # Draw ring members — highlighted with thick border so you can see the ring
     ring_in_sub = [n for n in ring_members_in_sub
                    if n in sub_nodes and n != selected_node]
     if ring_in_sub:
@@ -485,7 +462,6 @@ with tab1:
                                node_color="red", node_size=280,
                                edgecolors="yellow", linewidths=2.5)
 
-    # Draw the selected node — biggest, most visible
     nx.draw_networkx_nodes(G, pos, nodelist=[selected_node], ax=ax,
                            node_color="yellow", node_size=450,
                            edgecolors="black", linewidths=2)
@@ -498,7 +474,7 @@ with tab1:
     if ring_in_sub:
         legend_handles.append(
             Patch(facecolor="red", edgecolor="yellow", linewidth=2,
-                  label=f"Ring #{ring['ring_number']} members in view ({len(ring_in_sub)})")
+                  label=f"Ring #{ring['ring_number']} members ({len(ring_in_sub)})")
         )
     ax.legend(handles=legend_handles, loc="upper left", fontsize=9)
     ax.set_title(
@@ -509,59 +485,42 @@ with tab1:
     st.pyplot(fig)
     plt.close()
 
-    st.caption(
-        f"Nodes with yellow border = confirmed ring members from Union-Find. "
-        f"The GNN aggregated all {len(sub_nodes)} nodes in this view to make its prediction."
-    )
-
 
 # ════════════════════════════════════════════════════════════
 # TAB 2 — ALL FRAUD RINGS
-# Simple table showing every ring Union-Find detected.
-# Proves the algorithm found real coordinated fraud clusters.
 # ════════════════════════════════════════════════════════════
 with tab2:
     st.subheader("All Fraud Rings Detected by Union-Find")
     st.write(
         f"Union-Find found **{len(fraud_rings)} fraud rings** in the graph. "
-        f"Each row is a connected component where the majority of labeled nodes are fraudulent. "
-        f"The Union-Find root is the representative node for that component after path compression."
+        f"Each row is a connected component where the majority of labeled nodes are fraudulent."
     )
 
     if fraud_rings:
-        # Summary metrics
         mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Total Rings Found",     len(fraud_rings))
-        mc2.metric("Largest Ring",          fraud_rings[0]["size"])
-        mc3.metric("Total Nodes in Rings",  sum(r["size"] for r in fraud_rings))
+        mc1.metric("Total Rings Found",    len(fraud_rings))
+        mc2.metric("Largest Ring",         fraud_rings[0]["size"])
+        mc3.metric("Total Nodes in Rings", sum(r["size"] for r in fraud_rings))
 
         st.divider()
 
-        # Full table — every column comes directly from Union-Find output
-        table_rows = []
-        for ring in fraud_rings:
-            table_rows.append({
-                "Ring #"              : ring["ring_number"],
-                "Union-Find Root"     : ring["root"],       # ← direct from uf.find()
-                "Total Members"       : ring["size"],
-                "Fraud Nodes"         : ring["fraud_nodes"],
-                "Fraud %"             : f"{ring['fraud_ratio']:.0%}",
-            })
+        table_rows = [{
+            "Ring #"          : r["ring_number"],
+            "Union-Find Root" : r["root"],
+            "Total Members"   : r["size"],
+            "Fraud Nodes"     : r["fraud_nodes"],
+            "Fraud %"         : f"{r['fraud_ratio']:.0%}",
+        } for r in fraud_rings]
 
-        st.dataframe(
-            pd.DataFrame(table_rows),
-            hide_index       = True,
-            use_container_width = True
-        )
+        st.dataframe(pd.DataFrame(table_rows), hide_index=True,
+                     use_container_width=True)
 
         st.caption(
-            "Union-Find Root = the parent node after path compression. "
-            "Two nodes share a root if and only if they are in the same connected component. "
-            "This is the direct output of uf.find() — no post-processing."
+            "Union-Find Root = parent node after path compression. "
+            "Two nodes are in the same ring if and only if uf.find(a) == uf.find(b)."
         )
-
     else:
-        st.info("No fraud rings detected. Try lowering the minimum size in the code.")
+        st.info("No fraud rings detected.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -570,7 +529,6 @@ with tab2:
 with tab3:
     st.subheader("GraphSAGE Model Performance on Test Set")
 
-    model.eval()
     with torch.no_grad():
         out  = model(data.x, data.edge_index)
         pred = out.argmax(dim=1)
@@ -606,13 +564,12 @@ with tab3:
 
     st.write(f"""
 - **True Positives  (tp = {tp})** — fraud caught correctly ✅
-- **False Negatives (fn = {fn})** — fraud missed ← the costly error in real fraud detection
-- **False Positives (fp = {fp})** — legit flagged as fraud (goes to human review)
+- **False Negatives (fn = {fn})** — fraud missed ← the costly error
+- **False Positives (fp = {fp})** — legit flagged as fraud
 - **True Negatives  (tn = {tn})** — legit correctly cleared ✅
     """)
 
     st.info(
-        f"**Why recall ({recall:.2f}) matters most:** "
-        f"Missing a fraud case costs far more than a false alarm. "
-        f"Our model catches {recall*100:.0f}% of all fraud cases in the test set."
+        f"Recall = {recall:.2f} → catches {recall*100:.0f}% of all fraud. "
+        f"More important than accuracy on imbalanced data."
     )
